@@ -1,151 +1,432 @@
 """
 mini_cordis.py - 一个极简的 Cordis 风格插件框架
+
+相对旧版的主要改动（对齐原版 Cordis 的可逆副作用模型）：
+1. provide/on/on_depend/effect 均返回 disposer（可逆资源释放函数），
+   卸载时框架自动按逆序调用，不用手动在每个插件里记账。
+2. 归属插件由框架自动追踪（加载时记录 current_plugin），
+   插件代码不再需要手动写 ctx.effect("timer", ...) 这种 owner。
+   旧签名 ctx.effect(owner, setup, teardown) 仍兼容。
+3. teardown 支持异步（async def），卸载时会正确 await 清理。
+4. 事件总线支持四种分发模式：emit（顺序观察、无返回值、错误隔离）、
+   waterfall（环绕中间件，可短路）、serial（有序+返回值）、parallel（并行扇出）。
+5. emit 做了错误隔离：单个监听器抛错不会阻断其他监听器。
+6. Context 支持属性式服务访问（ctx.log / ctx.psu），并暴露上下文管理方法。
+7. 新增 ctx.setTimeout/ctx.setInterval 计时助手，自动注册为可逆副作用，
+   插件无需手写 running/task 样板。
 """
 
-from typing import Dict, List, Any, Callable, Protocol
+from __future__ import annotations
+
+from typing import Dict, List, Any, Callable, Optional, Awaitable, Protocol
 import asyncio
+import threading
+import time
+import warnings
+
+# 类型别名：一个可逆副作用。setup 先执行产生资源，teardown 负责撤销。
+EffectFn = Callable[[], Any]
+# 事件分发时"继续执行下游"的句柄。
+NextFn = Callable[[Any], Awaitable[Any]]
 
 
 # ---------- 1. 副作用（Effect） ----------
 class Effect:
-    """可逆副作用：记录一个操作及其撤销方法"""
-    def __init__(self, owner: str, setup: Callable[[], None], teardown: Callable[[], None]):
+    """可逆副作用：记录一个操作及其撤销方法，支持异步 teardown。"""
+
+    def __init__(self, owner: str, setup: EffectFn, teardown: EffectFn):
         self.owner = owner
         self._setup = setup
-        self._teardown = teardown
+        self._teardown = teardown or (lambda: None)
+        self._applied = False
 
     def apply(self):
-        self._setup()
+        """执行 setup，仅执行一次。"""
+        if not self._applied:
+            self._applied = True
+            self._setup()
 
-    def revert(self):
-        self._teardown()
+    async def revert(self):
+        """执行 teardown（若为协程则 await），仅执行一次。"""
+        if not self._applied:
+            return
+        self._applied = False
+        out = self._teardown()
+        if asyncio.iscoroutine(out):
+            await out
 
 
 # ---------- 2. 上下文（Context） ----------
 class Context:
-    """插件运行环境：服务注册 + 副作用记录 + 事件总线"""
+    """插件运行环境：服务注册 + 副作用记录 + 事件总线。"""
+
     def __init__(self):
         self._services: Dict[str, Any] = {}
         self._effects: List[Effect] = []
         self._event_listeners: Dict[str, List[Callable]] = {}
-        self._current_plugin: str | None = None
+        self._current_plugin: Optional[str] = None
         # ---- 依赖关系追踪 ----
-        self._dependencies: Dict[str, List[str]] = {}   # 插件名 -> 它 inject 的服务名
-        self._dependents: Dict[str, List[str]] = {}     # 服务名 -> 依赖它的插件名列表
-        self._service_owners: Dict[str, str] = {}       # 服务名 -> 提供者插件名
-        self._provided: Dict[str, List[str]] = {}       # 插件名 -> 它提供的服务名列表
-        self._depend_hooks: Dict[str, List[Callable[[str], None]]] = {}  # 服务名 -> 回调
+        self._dependencies: Dict[str, List[str]] = {}  # 插件名 -> 它 inject 的服务名
+        self._dependents: Dict[str, List[str]] = {}  # 服务名 -> 依赖它的插件名列表
+        self._service_owners: Dict[str, str] = {}  # 服务名 -> 提供者插件名
+        self._provided: Dict[str, List[str]] = {}  # 插件名 -> 它提供的服务名列表
+        self._depend_hooks: Dict[
+            str, List[Callable[[str], None]]
+        ] = {}  # 服务名 -> 回调
+
+    # ---------- 归属插件解析 ----------
+    @property
+    def _owner(self) -> str:
+        return self._current_plugin or "unknown"
 
     # ---- 服务管理 ----
-    def provide(self, name: str, service: Any):
-        owner = self._current_plugin or "unknown"
+    def provide(self, name: str, service: Any) -> Callable[[], None]:
+        """注册一个服务，返回卸载该服务的 disposer。"""
+        owner = self._owner
 
-        # 服务注册本身也作为可逆副作用：卸载时自动从登记簿移除
-        def _setup():
+        def setup():
             self._services[name] = service
 
-        def _teardown():
+        def teardown():
             self._services.pop(name, None)
 
-        self.effect(owner, _setup, _teardown)
-
-        # 记录服务归属（依赖图元数据）
         self._service_owners[name] = owner
         self._provided.setdefault(owner, []).append(name)
+        return self.effect(setup, teardown)
 
-    def get(self, name: str) -> Any:
+    def get(self, name: str, strict: bool = True) -> Any:
+        """读取服务。strict=True 时仅返回"提供方当前仍存活"的服务。"""
+        if not strict:
+            return self._services.get(name)
+        owner = self._service_owners.get(name)
+        if owner is not None and not self._is_owner_active(owner):
+            return None
         return self._services.get(name)
 
-    # ---- 依赖关系查询 ----
+    def _is_owner_active(self, owner: str) -> bool:
+        """owner 当前是否存活（还有副作用，即尚未被卸载）。"""
+        return any(e.owner == owner and e._applied for e in self._effects)
+
+    def set(self, name: str, value: Any):
+        """覆盖已提供服务的值；只允许提供方设置。"""
+        owner = self._service_owners.get(name)
+        if owner is None or owner != self._owner:
+            raise RuntimeError(f"服务 {name} 不存在或不属于当前插件")
+        self._services[name] = value
+
+    def __getattr__(self, name: str):
+        """属性式服务访问：ctx.log、ctx.psu。"""
+        services = self.__dict__.get("_services")
+        if services and name in services:
+            return services[name]
+        raise AttributeError(f"context has no service or attribute {name!r}")
+
+    def mixin(self, service_name: str, keys: Optional[List[str]] = None):
+        """把某个服务的可调用成员在 context 上暴露为转发方法，卸载时移除。"""
+        svc = self.get(service_name)
+        if svc is None:
+            raise RuntimeError(f"服务 {service_name} 尚未就绪，无法 mixin")
+        source = [k for k in dir(svc) if not k.startswith("_")]
+        targets = (
+            keys
+            if keys is not None
+            else [k for k in source if callable(getattr(svc, k))]
+        )
+
+        forwarders: List[tuple] = []
+        for k in targets:
+            attr = getattr(svc, k)
+            if not callable(attr):
+                continue
+
+            def make(key):
+                def forward(*args, **kwargs):
+                    return getattr(self.get(service_name), key)(*args, **kwargs)
+
+                return forward
+
+            forwarders.append((k, make(k)))
+
+        def apply_mixins():
+            for k, bound in forwarders:
+                setattr(self, k, bound)
+
+        def remove_mixins():
+            for k, _ in forwarders:
+                if k in self.__dict__:
+                    del self.__dict__[k]
+
+        return self.effect(apply_mixins, remove_mixins)
+
+    # ---- 依赖关系查询 ----（与旧版保持一致）
     def get_dependents(self, service_name: str) -> List[str]:
-        """谁依赖了这个服务（返回插件名列表）"""
         return list(self._dependents.get(service_name, []))
 
     def get_dependencies(self, plugin_name: str) -> List[str]:
-        """这个插件依赖了哪些服务"""
         return list(self._dependencies.get(plugin_name, []))
 
-    def get_owner(self, service_name: str) -> str | None:
-        """这个服务是谁提供的（插件名）"""
+    def get_owner(self, service_name: str) -> Optional[str]:
         return self._service_owners.get(service_name)
 
     def who_uses_me(self, plugin_name: str) -> set[str]:
-        """谁在引用我（通过我提供的任一服务）"""
         users: set[str] = set()
         for svc in self._provided.get(plugin_name, []):
             users.update(self._dependents.get(svc, []))
         return users
 
-    # ---- 副作用注册 ----
-    def effect(self, owner: str, setup: Callable[[], None], teardown: Callable[[], None]):
-        effect = Effect(owner, setup, teardown)
-        effect.apply()
-        self._effects.append(effect)
+    # ---- 副作用注册（核心） ----（签名 4 种）
+    def effect(self, *args) -> Callable[[], None]:
+        """注册一个可逆副作用，返回 disposer。
+
+        支持三种调用方式：
+          ctx.effect(setup, teardown)              # 归属当前插件
+          ctx.effect(owner, setup, teardown)       # 显式归属（旧签名）
+          ctx.effect(setup)                        # teardown 缺省为 no-op
+        """
+        if len(args) == 3:
+            owner, setup, teardown = args
+        elif len(args) == 2:
+            setup, teardown = args
+            owner = self._owner
+        elif len(args) == 1:
+            (setup,) = args
+            teardown = None
+            owner = self._owner
+        else:
+            raise TypeError("effect() 接受 1~3 个参数")
+
+        eff = Effect(owner, setup, teardown)
+        eff.apply()
+        self._effects.append(eff)
+
+        def disposer():
+            self._detach_effect(eff)
+
+        return disposer
+
+    def _detach_effect(self, eff: Effect):
+        """移除单个副作用并执行 teardown（同步优先，异步则排入事件循环）。"""
+        if eff in self._effects:
+            self._effects.remove(eff)
+        out = eff._teardown()
+        eff._applied = False
+        if asyncio.iscoroutine(out):
+            self._run_coroutine(out)
+
+    def _run_coroutine(self, coro):
+        """在运行中的事件循环上调度一个协程；无循环则告警。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            warnings.warn("detached an async teardown but no event loop is running")
+            return
+        loop.create_task(coro)
 
     # ---- 事件总线 ----
-    def on(self, event: str, handler: Callable):
-        """注册事件监听（作为副作用，归属当前插件）"""
-        owner = self._current_plugin or "unknown"
+    def on(self, event: str, handler: Callable) -> Callable[[], None]:
+        """注册事件监听（作为副作用），返回解除监听的 disposer。"""
+        owner = self._owner
 
-        def _setup():
+        def setup():
             self._event_listeners.setdefault(event, []).append(handler)
 
-        def _teardown():
+        def teardown():
             listeners = self._event_listeners.get(event, [])
             if handler in listeners:
                 listeners.remove(handler)
 
-        self.effect(owner, _setup, _teardown)
+        return self.effect(setup, teardown)
 
-    def on_depend(self, service_name: str, hook: Callable[[str], None]):
-        """每当有插件开始依赖 service_name 时，调用 hook(依赖者插件名)。作为副作用注册。"""
-        owner = self._current_plugin or "unknown"
+    def on_depend(
+        self, service_name: str, hook: Callable[[str], None]
+    ) -> Callable[[], None]:
+        """每当有插件开始依赖 service_name 时，调用 hook(依赖者插件名)。"""
+        owner = self._owner
 
-        def _setup():
+        def setup():
             self._depend_hooks.setdefault(service_name, []).append(hook)
 
-        def _teardown():
+        def teardown():
             hooks = self._depend_hooks.get(service_name, [])
             if hook in hooks:
                 hooks.remove(hook)
 
-        self.effect(owner, _setup, _teardown)
+        return self.effect(setup, teardown)
 
-    async def emit(self, event: str, data: Any = None):
-        """触发事件"""
-        for handler in self._event_listeners.get(event, []):
-            # 简单并发执行
-            await handler(data)
+    async def emit(self, event: str, data: Any = None) -> None:
+        """顺序观察，监听器按注册顺序执行；单个监听器出错不影响其他（错误隔离）。"""
+        for handler in list(self._event_listeners.get(event, [])):
+            try:
+                await self._safe_call(handler, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._report_error(event, handler, e)
+
+    def _safe_call(self, handler: Callable, data: Any) -> Awaitable:
+        out = handler(data)
+        if asyncio.iscoroutine(out):
+            return out
+
+        async def _noop():
+            return out
+
+        return _noop()
+
+    async def waterfall(self, event: str, data: Any = None) -> Any:
+        """环绕中间件：监听器接收 (data, next)；调用 next 继续下游，否则短路。
+
+        每个监听器的返回值会向上游传递；若监听器返回 (await next(x)) 的包装值，
+        上游看到的就是包装后的结果。不调用 next 则短路。
+        """
+        handlers = list(self._event_listeners.get(event, []))
+
+        async def run(i: int, value: Any) -> Any:
+            if i >= len(handlers):
+                return value
+            handler = handlers[i]
+
+            async def next_(v):
+                return await run(i + 1, v)
+
+            out = handler(value, next_)
+            if asyncio.iscoroutine(out):
+                out = await out
+            return out
+
+        return await run(0, data)
+
+    async def serial(self, event: str, data: Any = None) -> Any:
+        """按注册顺序执行，每个监听器的返回值传给下一个。"""
+        value = data
+        for handler in list(self._event_listeners.get(event, [])):
+            try:
+                value = await self._safe_call(handler, value)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._report_error(event, handler, e)
+        return value
+
+    async def parallel(self, event: str, data: Any = None) -> None:
+        """所有监听器并行观察事件，等待全部完成（错误隔离）。"""
+        handlers = list(self._event_listeners.get(event, []))
+        results = await asyncio.gather(
+            *(self._safe_call(h, data) for h in handlers),
+            return_exceptions=True,
+        )
+        for handler, result in zip(handlers, results):
+            if isinstance(result, Exception) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                self._report_error(event, handler, result)
+
+    @staticmethod
+    def _report_error(event: str, handler, error: Exception):
+        print(f"[error] 事件监听器 {event} 抛错: {error!r}")
+
+    # ---- 计时助手 ----
+    def setTimeout(
+        self, delay: float, callback: Callable[[], Any]
+    ) -> Callable[[], None]:
+        """延时调用 callback；作为副作用注册，卸载时自动取消。"""
+        loop = asyncio.get_running_loop()
+        handle = {"cancelled": False}
+
+        async def run():
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if not handle["cancelled"]:
+                try:
+                    out = callback()
+                    if asyncio.iscoroutine(out):
+                        await out
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._report_error("setTimeout", callback, e)
+
+        def setup():
+            loop.create_task(run())
+
+        def teardown():
+            handle["cancelled"] = True
+
+        return self.effect(setup, teardown)
+
+    def setInterval(
+        self, delay: float, callback: Callable[[], Any]
+    ) -> Callable[[], None]:
+        """每隔 delay 秒调用 callback（无参数）；作为副作用注册，卸载时自动取消。"""
+        loop = asyncio.get_running_loop()
+        handle = {"cancelled": False}
+
+        async def run():
+            while not handle["cancelled"]:
+                await asyncio.sleep(delay)
+                if handle["cancelled"]:
+                    break
+                try:
+                    out = callback()
+                    if asyncio.iscoroutine(out):
+                        await out
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    self._report_error("setInterval", callback, e)
+
+        def setup():
+            loop.create_task(run())
+
+        def teardown():
+            handle["cancelled"] = True
+
+        return self.effect(setup, teardown)
 
     # ---- 卸载插件 ----
-    def revert_effects_for(self, owner: str):
-        """撤销指定插件的所有副作用（卸载）"""
+    def _effects_for(self, owner: str) -> List[Effect]:
+        return [e for e in self._effects if e.owner == owner]
+
+    def revert_effects_for(self, owner: str) -> None:
+        """撤销指定插件的所有副作用（同步路径；异步 teardown 会排入事件循环）。"""
+        pending = []
         remaining = []
-        for effect in self._effects:
-            if effect.owner == owner:
-                effect.revert()
+        for eff in self._effects:
+            if eff.owner == owner:
+                out = eff._teardown()
+                eff._applied = False
+                if asyncio.iscoroutine(out):
+                    pending.append(out)
             else:
-                remaining.append(effect)
+                remaining.append(eff)
+        self._effects = remaining
+        for coro in pending:
+            self._run_coroutine(coro)
+
+    # 提供异步卸载的接口（若插件使用了异步 teardown，建议调用它）
+    async def dispose(self, owner: str) -> None:
+        """异步撤销指定插件的全部副作用（会 await 异步 teardown）。"""
+        remaining = []
+        for eff in self._effects:
+            if eff.owner == owner:
+                await eff.revert()
+            else:
+                remaining.append(eff)
         self._effects = remaining
 
 
 # ---------- 3. 插件协议（Protocol） ----------
 class Plugin(Protocol):
     name: str
-    inject: List[str]  # 依赖的服务名列表
+    inject: List[str]
 
-    def apply(self, ctx: Context):
-        ...
+    def apply(self, ctx: Context): ...
 
 
 def validate_plugin(plugin: Plugin) -> None:
-    """校验插件是否符合规范，不符合抛 ValueError。
-
-    检查项：
-    1. name 存在且为非空字符串
-    2. inject 存在且为字符串列表
-    3. apply 存在且可调用
-    """
+    """校验插件是否符合规范，不符合抛 ValueError。"""
     name = getattr(plugin, "name", None)
     if not isinstance(name, str) or not name:
         raise ValueError("插件缺少有效的 name（非空字符串）")
@@ -165,12 +446,11 @@ class Cordis:
         self._loaded: List[str] = []  # 记录加载顺序，用于逆序卸载
 
     def load_plugin(self, plugin: Plugin):
-        """加载插件：校验规范 -> 检查依赖 -> 记录依赖关系 -> 执行 apply"""
+        """加载插件：校验规范 -> 检查依赖 -> 记录依赖关系 -> 执行 apply。"""
         validate_plugin(plugin)
 
-        # 检查依赖是否满足
         for dep in plugin.inject:
-            if self.ctx.get(dep) is None:
+            if self.ctx.get(dep, strict=False) is None:
                 raise RuntimeError(f"缺少依赖服务: {dep}")
 
         if plugin.name in self.ctx._dependencies:
@@ -179,7 +459,7 @@ class Cordis:
         # 正向：记录该插件依赖了哪些服务
         self.ctx._dependencies[plugin.name] = list(plugin.inject)
 
-        # 反向：记录“谁依赖了这个服务”，并通知已注册的监听者
+        # 反向：记录"谁依赖了这个服务"，并通知已注册的监听者
         for dep in plugin.inject:
             self.ctx._dependents.setdefault(dep, []).append(plugin.name)
             for hook in self.ctx._depend_hooks.get(dep, []):
@@ -188,25 +468,50 @@ class Cordis:
         # 将副作用归属到当前插件，执行 apply
         self.ctx._current_plugin = plugin.name
         try:
-            plugin.apply(self.ctx)
+            out = plugin.apply(self.ctx)
+            if asyncio.iscoroutine(out):
+                # 允许插件 apply 是 async 的，但加载过程为同步调用时标记警告
+                warnings.warn(
+                    f"插件 {plugin.name} 的 apply 是异步的，加载过程不会等待它完成"
+                )
         finally:
             self.ctx._current_plugin = None
 
         self._loaded.append(plugin.name)
 
-    def unload_plugin(self, plugin_name: str):
-        """卸载插件及其所有（传递）依赖者，按逆序逐个撤销。
+    async def load_plugin_async(self, plugin: Plugin):
+        """异步加载插件，支持 async 的 apply。"""
+        validate_plugin(plugin)
+        ctx = self.ctx
+        for dep in plugin.inject:
+            if ctx.get(dep, strict=False) is None:
+                raise RuntimeError(f"缺少依赖服务: {dep}")
+        if plugin.name in ctx._dependencies:
+            raise RuntimeError(f"插件已加载: {plugin.name}")
 
-        例如依赖链 app -> service -> db，调用 unload_plugin("db")
-        会级联卸载 app、service、db（按 app -> service -> db 逆序）。
-        """
+        ctx._dependencies[plugin.name] = list(plugin.inject)
+        for dep in plugin.inject:
+            ctx._dependents.setdefault(dep, []).append(plugin.name)
+            for hook in ctx._depend_hooks.get(dep, []):
+                hook(plugin.name)
+
+        ctx._current_plugin = plugin.name
+        try:
+            out = plugin.apply(ctx)
+            if asyncio.iscoroutine(out):
+                await out
+        finally:
+            ctx._current_plugin = None
+        self._loaded.append(plugin.name)
+
+    def unload_plugin(self, plugin_name: str):
+        """卸载插件及其所有（传递）依赖者，按逆序逐个撤销。"""
         affected = self._transitive_dependents(plugin_name) | {plugin_name}
         for name in reversed(list(self._loaded)):
             if name in affected:
                 self._unload_one(name)
 
     def _transitive_dependents(self, plugin_name: str) -> set[str]:
-        """返回所有直接/间接依赖 plugin_name 的插件名集合"""
         result: set[str] = set()
         stack = list(self.ctx.who_uses_me(plugin_name))
         while stack:
@@ -218,50 +523,64 @@ class Cordis:
         return result
 
     def _unload_one(self, plugin_name: str):
-        """卸载单个插件（不级联），并清理依赖图"""
-        # 撤销副作用（含服务移除、事件监听、后台任务等）
+        """卸载单个插件（不级联），并清理依赖图。"""
         self.ctx.revert_effects_for(plugin_name)
 
-        # 清理正向记录
         self.ctx._dependencies.pop(plugin_name, None)
 
-        # 清理我提供的服务及其归属
         for svc in self.ctx._provided.pop(plugin_name, []):
             self.ctx._service_owners.pop(svc, None)
             self.ctx._dependents.pop(svc, None)
 
-        # 从反向索引里移除“我作为依赖者”的记录
         for deps in self.ctx._dependents.values():
             if plugin_name in deps:
                 deps.remove(plugin_name)
 
-        # 从加载顺序里移除
+        if plugin_name in self._loaded:
+            self._loaded.remove(plugin_name)
+
+    async def unload_plugin_async(self, plugin_name: str):
+        """异步卸载插件及其依赖者（会 await 异步 teardown）。"""
+        affected = self._transitive_dependents(plugin_name) | {plugin_name}
+        for name in reversed(list(self._loaded)):
+            if name in affected:
+                await self._unload_one_async(name)
+
+    async def _unload_one_async(self, plugin_name: str):
+        await self.ctx.dispose(plugin_name)
+        self.ctx._dependencies.pop(plugin_name, None)
+        for svc in self.ctx._provided.pop(plugin_name, []):
+            self.ctx._service_owners.pop(svc, None)
+            self.ctx._dependents.pop(svc, None)
+        for deps in self.ctx._dependents.values():
+            if plugin_name in deps:
+                deps.remove(plugin_name)
         if plugin_name in self._loaded:
             self._loaded.remove(plugin_name)
 
     def load_all(self, plugins: List[Plugin]):
-        """批量加载：自动按依赖顺序（被依赖者先加载）。
-
-        反复扫描剩余插件，依赖已满足的就加载，直到全部加载完；
-        若某一轮无任何进展，说明存在循环依赖或缺少依赖。
-        """
+        """批量加载：自动按依赖顺序（被依赖者先加载）。"""
         remaining = list(plugins)
         while remaining:
             progress = False
             for plugin in remaining[:]:
-                if any(self.ctx.get(dep) is None for dep in plugin.inject):
-                    continue  # 依赖还没就绪，等下一轮
+                if any(
+                    self.ctx.get(dep, strict=False) is None for dep in plugin.inject
+                ):
+                    continue
                 self.load_plugin(plugin)
                 remaining.remove(plugin)
                 progress = True
             if not progress:
                 unresolved = ", ".join(
-                    f"{p.name}(缺 {[d for d in p.inject if self.ctx.get(d) is None]})"
+                    f"{p.name}(缺 {[d for d in p.inject if self.ctx.get(d, strict=False) is None]})"
                     for p in remaining
                 )
-                raise RuntimeError(f"无法确定加载顺序（循环依赖或缺少依赖）: {unresolved}")
+                raise RuntimeError(
+                    f"无法确定加载顺序（循环依赖或缺少依赖）: {unresolved}"
+                )
 
     def unload_all(self):
-        """批量卸载：按加载顺序的逆序（后加载的先卸载）"""
+        """批量卸载：按加载顺序的逆序（后加载的先卸载）。"""
         while self._loaded:
             self._unload_one(self._loaded[-1])
