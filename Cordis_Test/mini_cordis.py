@@ -20,9 +20,11 @@ from __future__ import annotations
 
 from typing import Dict, List, Any, Callable, Optional, Awaitable, Protocol
 import asyncio
+import importlib.util
 import threading
 import time
 import warnings
+from pathlib import Path
 
 # 类型别名：一个可逆副作用。setup 先执行产生资源，teardown 负责撤销。
 EffectFn = Callable[[], Any]
@@ -65,6 +67,7 @@ class Context:
         self._effects: List[Effect] = []
         self._event_listeners: Dict[str, List[Callable]] = {}
         self._current_plugin: Optional[str] = None
+        self._current_config: Any = None
         # ---- 依赖关系追踪 ----
         self._dependencies: Dict[str, List[str]] = {}  # 插件名 -> 它 inject 的服务名
         self._dependents: Dict[str, List[str]] = {}  # 服务名 -> 依赖它的插件名列表
@@ -73,6 +76,17 @@ class Context:
         self._depend_hooks: Dict[
             str, List[Callable[[str], None]]
         ] = {}  # 服务名 -> 回调
+
+    # ---------- 实例身份 ----------
+    @property
+    def name(self) -> Optional[str]:
+        """当前正在 apply 的插件的实例 key（None = 不在插件加载流程中）。"""
+        return self._current_plugin
+
+    @property
+    def config(self) -> Any:
+        """当前正在 apply 的插件的实例配置（由 load_plugin(..., config=...) 传入）。"""
+        return self._current_config
 
     # ---------- 归属插件解析 ----------
     @property
@@ -439,70 +453,110 @@ def validate_plugin(plugin: Plugin) -> None:
         raise ValueError(f"插件 {name} 缺少可调用的 apply 方法")
 
 
+def scan_plugins(directory: Path, skip_private: bool = True) -> List[Any]:
+    """扫描目录，动态导入所有插件模块，返回插件实例列表。
+
+    约定：每个模块暴露一个名为 Plugin 的类，且通过 validate_plugin 校验。
+    单个插件加载失败会被跳过并打印警告，不影响其他插件。
+    """
+    plugins = []
+    for path in sorted(directory.glob("*.py")):
+        if skip_private and path.name.startswith("_"):
+            continue
+        try:
+            module_name = path.stem
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"无法为 {path} 创建模块规格")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            plugin = module.Plugin()
+            validate_plugin(plugin)
+            plugins.append(plugin)
+        except Exception as e:
+            print(f"[warn] 加载插件失败 {path.name}: {e}")
+    return plugins
+
+
 # ---------- 4. 核心加载器 ----------
 class Cordis:
     def __init__(self):
         self.ctx = Context()
         self._loaded: List[str] = []  # 记录加载顺序，用于逆序卸载
 
-    def load_plugin(self, plugin: Plugin):
-        """加载插件：校验规范 -> 检查依赖 -> 记录依赖关系 -> 执行 apply。"""
+    def load_plugin(self, plugin: Plugin, key: Optional[str] = None, config: Any = None):
+        """加载插件：校验规范 -> 检查依赖 -> 记录依赖关系 -> 执行 apply。
+
+        key：实例标识，缺省为 plugin.name。同一插件定义要加载多个实例时，
+        必须传入不同的 key（如 "dji.0"、"dji.1"）。插件内可用 ctx.name 读取。
+        config：该实例的私有配置，插件内用 ctx.config 读取。
+        """
         validate_plugin(plugin)
+        key = key or plugin.name
 
         for dep in plugin.inject:
             if self.ctx.get(dep, strict=False) is None:
                 raise RuntimeError(f"缺少依赖服务: {dep}")
 
-        if plugin.name in self.ctx._dependencies:
-            raise RuntimeError(f"插件已加载: {plugin.name}")
+        if key in self.ctx._dependencies:
+            raise RuntimeError(
+                f"插件已加载: {key}（同一插件定义多实例请传 key=...）"
+            )
 
         # 正向：记录该插件依赖了哪些服务
-        self.ctx._dependencies[plugin.name] = list(plugin.inject)
+        self.ctx._dependencies[key] = list(plugin.inject)
 
         # 反向：记录"谁依赖了这个服务"，并通知已注册的监听者
         for dep in plugin.inject:
-            self.ctx._dependents.setdefault(dep, []).append(plugin.name)
+            self.ctx._dependents.setdefault(dep, []).append(key)
             for hook in self.ctx._depend_hooks.get(dep, []):
-                hook(plugin.name)
+                hook(key)
 
-        # 将副作用归属到当前插件，执行 apply
-        self.ctx._current_plugin = plugin.name
+        # 将副作用归属到当前插件实例，执行 apply
+        self.ctx._current_plugin = key
+        self.ctx._current_config = config
         try:
             out = plugin.apply(self.ctx)
             if asyncio.iscoroutine(out):
                 # 允许插件 apply 是 async 的，但加载过程为同步调用时标记警告
                 warnings.warn(
-                    f"插件 {plugin.name} 的 apply 是异步的，加载过程不会等待它完成"
+                    f"插件 {key} 的 apply 是异步的，加载过程不会等待它完成"
                 )
         finally:
             self.ctx._current_plugin = None
+            self.ctx._current_config = None
 
-        self._loaded.append(plugin.name)
+        self._loaded.append(key)
 
-    async def load_plugin_async(self, plugin: Plugin):
-        """异步加载插件，支持 async 的 apply。"""
+    async def load_plugin_async(self, plugin: Plugin, key=None, config=None):
+        """异步加载插件，支持 async 的 apply（key/config 语义同 load_plugin）。"""
         validate_plugin(plugin)
+        key = key or plugin.name
         ctx = self.ctx
         for dep in plugin.inject:
             if ctx.get(dep, strict=False) is None:
                 raise RuntimeError(f"缺少依赖服务: {dep}")
-        if plugin.name in ctx._dependencies:
-            raise RuntimeError(f"插件已加载: {plugin.name}")
+        if key in ctx._dependencies:
+            raise RuntimeError(
+                f"插件已加载: {key}（同一插件定义多实例请传 key=...）"
+            )
 
-        ctx._dependencies[plugin.name] = list(plugin.inject)
+        ctx._dependencies[key] = list(plugin.inject)
         for dep in plugin.inject:
-            ctx._dependents.setdefault(dep, []).append(plugin.name)
+            ctx._dependents.setdefault(dep, []).append(key)
             for hook in ctx._depend_hooks.get(dep, []):
-                hook(plugin.name)
+                hook(key)
 
-        ctx._current_plugin = plugin.name
+        ctx._current_plugin = key
+        ctx._current_config = config
         try:
             out = plugin.apply(ctx)
             if asyncio.iscoroutine(out):
                 await out
         finally:
             ctx._current_plugin = None
-        self._loaded.append(plugin.name)
+            ctx._current_config = None
+        self._loaded.append(key)
 
     def unload_plugin(self, plugin_name: str):
         """卸载插件及其所有（传递）依赖者，按逆序逐个撤销。"""
@@ -558,27 +612,50 @@ class Cordis:
         if plugin_name in self._loaded:
             self._loaded.remove(plugin_name)
 
-    def load_all(self, plugins: List[Plugin]):
-        """批量加载：自动按依赖顺序（被依赖者先加载）。"""
-        remaining = list(plugins)
+    def load_all(self, plugins: List[Plugin], keys: Optional[List[str]] = None):
+        """批量加载：自动按依赖顺序（被依赖者先加载）。
+
+        keys：与 plugins 等长的实例 key 列表，缺省时使用各插件 name。
+        """
+        if keys is None:
+            keys = [p.name for p in plugins]
+        else:
+            keys = list(keys)
+        if len(keys) != len(plugins):
+            raise ValueError("keys 的长度必须与 plugins 一致")
+
+        remaining = list(zip(plugins, keys))
         while remaining:
             progress = False
-            for plugin in remaining[:]:
+            for idx, (plugin, key) in enumerate(remaining):
                 if any(
                     self.ctx.get(dep, strict=False) is None for dep in plugin.inject
                 ):
                     continue
-                self.load_plugin(plugin)
-                remaining.remove(plugin)
+                self.load_plugin(plugin, key=key)
+                remaining.pop(idx)
                 progress = True
+                break
             if not progress:
                 unresolved = ", ".join(
                     f"{p.name}(缺 {[d for d in p.inject if self.ctx.get(d, strict=False) is None]})"
-                    for p in remaining
+                    for p, _ in remaining
                 )
                 raise RuntimeError(
                     f"无法确定加载顺序（循环依赖或缺少依赖）: {unresolved}"
                 )
+
+    def load_dir(self, directory: Path, *, exclude=()) -> List[str]:
+        """扫描并加载目录下的所有插件（依赖自动排序），返回已加载的插件名列表。
+
+        exclude：要跳过的插件名集合（例如已单独加载的 UI 叶子插件）。
+        """
+        plugins = scan_plugins(directory)
+        plugins = [p for p in plugins if p.name not in exclude]
+        names = {p.name for p in plugins}
+        self.load_all(plugins)
+        # 按真实加载顺序返回
+        return [n for n in self._loaded if n in names]
 
     def unload_all(self):
         """批量卸载：按加载顺序的逆序（后加载的先卸载）。"""

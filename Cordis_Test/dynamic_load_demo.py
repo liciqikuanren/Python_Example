@@ -1,9 +1,8 @@
 """
-dynamic_load_demo.py - 案例：从外部目录动态加载插件（importlib）
+dynamic_load_demo.py - 案例：从外部目录动态加载插件（框架内置 scan_plugins / load_dir）
 
-- 扫描 plugins/ 目录下的 .py 文件，按文件名动态导入
-- 每个插件模块约定暴露一个 Plugin 类
-- 用 load_all 自动按依赖顺序加载（乱序扫描也没关系）
+- 用 cordis.load_dir 扫描 plugins/ 目录，自动按依赖顺序加载（乱序扫描也没关系）
+- load_dir 内部复用框架的 scan_plugins（约定每个模块暴露 Plugin 类并校验）
 - 演示运行时卸载 + 重新从磁盘加载
 """
 
@@ -11,39 +10,18 @@ import asyncio
 import importlib.util
 from pathlib import Path
 
-from mini_cordis import Cordis, validate_plugin
+from mini_cordis import Cordis, scan_plugins
 
 HERE = Path(__file__).parent
 PLUGINS_DIR = HERE / "plugins"
 
 
-def scan_plugins(directory: Path):
-    """扫描目录，动态导入所有插件模块，返回插件实例列表"""
-    plugins = []
-    for path in sorted(directory.glob("*.py")):
-        if path.name.startswith("_"):
-            continue
-        try:
-            module_name = path.stem
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"无法为 {path} 创建模块规格")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            plugin = module.Plugin()   # 约定：每个模块暴露 Plugin 类
-            validate_plugin(plugin)    # 校验规范，不合格则跳过
-            plugins.append(plugin)
-        except Exception as e:
-            print(f"⚠️ 加载插件失败 {path.name}: {e}")
-    return plugins
-
-
 async def main():
     cordis = Cordis()
 
-    print("--- 动态扫描 plugins/ 目录并加载 ---")
-    plugins = scan_plugins(PLUGINS_DIR)
-    cordis.load_all(plugins)   # 自动按依赖顺序加载
+    print("--- load_dir 扫描 plugins/ 目录并加载 ---")
+    loaded = cordis.load_dir(PLUGINS_DIR)
+    print(f"已加载: {loaded}")
 
     print("\n--- 运行 3 秒后触发 greet 事件 ---")
     await asyncio.sleep(3)

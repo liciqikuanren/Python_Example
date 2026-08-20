@@ -17,7 +17,6 @@ ui_app/main.py - 多插件仪器上位机仿真（PyQt6 + asyncio 双线程）
 """
 
 import asyncio
-import importlib.util
 import os
 import sys
 import threading
@@ -37,42 +36,15 @@ sys.path.insert(0, str(HERE.parent))
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
-from mini_cordis import Cordis, validate_plugin
-
-
-def scan_plugins(directory: Path) -> list:
-    """扫描目录，动态导入所有插件模块，返回插件实例列表。
-
-    约定：每个模块暴露一个名为 Plugin 的类。
-    """
-    plugins = []
-    for path in sorted(directory.glob("*.py")):
-        if path.name.startswith("_"):
-            continue
-        try:
-            module_name = path.stem
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"无法为 {path} 创建模块规格")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            plugin = module.Plugin()
-            validate_plugin(plugin)
-            plugins.append(plugin)
-        except Exception as e:
-            print(f"⚠️ 加载插件失败 {path.name}: {e}")
-    return plugins
+from mini_cordis import Cordis, scan_plugins
 
 
 def run_backend(cordis: Cordis, stop: threading.Event):
     """后台线程：asyncio 事件循环里加载业务插件并跑 12 秒。"""
 
     async def main_async():
-        plugins = scan_plugins(PLUGINS_DIR)
-        # 乱序传入，load_all 会自动按依赖排序加载（含 ui，但 UI 已在主线程单独加载，会被去重跳过）
-        cordis.load_all([
-            p for p in plugins if p.name != "ui"
-        ])
+        # UI 已在主线程单独加载，这里跳过；其余插件由 load_dir 自动按依赖排序加载
+        cordis.load_dir(PLUGINS_DIR, exclude={"ui"})
 
         # 运行 12 秒，观察数据流与告警
         await asyncio.sleep(12)
