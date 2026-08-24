@@ -1,0 +1,101 @@
+"""串口助手 Host（外壳，非插件）：启动 Qt + Cordis，加载插件并桥接双线程。
+
+架构：内核 core/mini_cordis + 薄 Host（本文件）+ 服务插件（plugins/）+ UI 叶子插件（ui/）。
+线程：主线程跑 Qt/UI，后台线程跑 asyncio 业务插件；Qt 信号桥接跨线程事件。
+"""
+
+import asyncio
+import os
+import sys
+import threading
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
+
+from core.mini_cordis import Cordis
+from core.theme import STYLESHEET, CheckBoxStyle
+
+PLUGINS_DIR = HERE / "plugins"
+
+
+def run_backend(cordis: Cordis, stop: threading.Event) -> None:
+    """后台线程：在 asyncio 循环里加载业务插件并维持运行。
+
+    加载策略：先加载 config（读取运行模式），再按 debug_mode 决定是否加载
+    调试插件（tcp_forward / justfloat / float_recorder）：
+      - 正常模式（debug_mode=False）：仅 AI 功能（ai_server 等）；
+      - 调试模式（debug_mode=True）：额外启用 TCP 转发、justfloat 解析、浮点录制。
+    """
+
+    async def main_async():
+        # 1. 配置插件先行（读取 debug_mode）
+        from plugins.config import Plugin as ConfigPlugin
+
+        cordis.load_plugin(ConfigPlugin())
+        loaded = ["config"]
+        debug_mode = bool(cordis.ctx.get("config").get("debug_mode", False))
+
+        # 暴露 Host 与后台循环（UI 控制器据此动态加载/卸载调试插件）
+        cordis.ctx.host = cordis
+        cordis.ctx.backend_loop = asyncio.get_running_loop()
+
+        # 2. 按模式加载其余业务插件
+        exclude = {"config"}
+        if not debug_mode:
+            exclude |= {"tcp_forward", "justfloat", "float_recorder"}
+        loaded += cordis.load_dir(PLUGINS_DIR, exclude=exclude)
+
+        await cordis.ctx.emit("services_ready", {"debug_mode": debug_mode})
+        try:
+            while not stop.is_set():
+                await asyncio.sleep(0.1)
+        finally:
+            # 逆序卸载业务插件（关闭串口、停记录），不动 UI 插件
+            for name in reversed(loaded):
+                try:
+                    cordis.unload_plugin(name)
+                except Exception:
+                    pass
+
+    asyncio.run(main_async())
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setStyle(CheckBoxStyle())
+    app.setStyleSheet(STYLESHEET)
+
+    cordis = Cordis()
+
+    # 1. 主线程先加载 UI 叶子插件（先订阅事件）
+    from ui import Plugin as UIPlugin
+    cordis.load_plugin(UIPlugin())
+
+    # 2. 后台线程跑业务插件
+    stop = threading.Event()
+    backend = threading.Thread(target=run_backend, args=(cordis, stop), daemon=True)
+    backend.start()
+
+    # 无头冒烟测试钩子：AUTO_QUIT_MS 可自动退出
+    auto_quit = os.environ.get("AUTO_QUIT_MS")
+    if auto_quit:
+        QTimer.singleShot(int(auto_quit), app.quit)
+
+    # 3. Qt 主循环
+    app.aboutToQuit.connect(stop.set)
+    code = app.exec()
+    backend.join(timeout=3)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
