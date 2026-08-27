@@ -23,6 +23,7 @@ class SerialController(QObject):
         tc = window.tcp
         jf = window.justfloat
         fr = window.recorder
+        rt = window.rtt
 
         # 视图 → 控制器
         s.open_clicked.connect(self._on_open)
@@ -31,7 +32,7 @@ class SerialController(QObject):
         s.params_changed.connect(self._persist_settings)
         s.load_config_clicked.connect(self._on_load_config)
         s.save_config_clicked.connect(self._on_save_config)
-        s.debug_mode_toggled.connect(self._on_debug_toggled)
+        s.mode_changed.connect(self._on_mode_changed)
         r.clear_clicked.connect(self._on_clear)
         r.save_clicked.connect(self._on_save)
         r.load_clicked.connect(self._on_load)
@@ -67,7 +68,14 @@ class SerialController(QObject):
         bridge.tcp_status.connect(self._on_tcp_status)
         bridge.justfloat_status.connect(self._on_justfloat_status)
         bridge.float_recorder_status.connect(self._on_recorder_status)
-        bridge.debug_mode_changed.connect(self._on_debug_changed)
+        bridge.mode_changed.connect(self._on_mode_changed_event)
+        rt.connect_clicked.connect(self._on_rtt_connect)
+        rt.send_shell.connect(self._on_rtt_send)
+        rt.settings_changed.connect(self._persist_settings)
+        bridge.rtt_shell_rx.connect(rt.append_shell)
+        bridge.rtt_log.connect(rt.append_log)
+        bridge.rtt_status.connect(rt.set_status)
+        bridge.rtt_shell_tx.connect(rt.append_command)
 
         # 录制剩余时间轮询（每 500ms 刷新状态标签）
         self._recorder_timer = QTimer(self)
@@ -99,13 +107,16 @@ class SerialController(QObject):
         self._w.tcp.apply_config(cfg.as_dict())
         self._w.justfloat.apply_config(cfg.as_dict())
         self._w.recorder.apply_config(cfg.as_dict())
+        self._w.rtt.apply_config(cfg.as_dict())
         self._w.settings.set_config_path(cfg.path)
-        debug_mode = bool(cfg.get("debug_mode", False))
-        self._w.set_debug_visible(debug_mode)
-        if debug_mode:
-            # 调试模式：justfloat 数据不注入 DSH 上下文（AI 看数据走录制 CSV）
-            self._w.settings.set_ai_push_enabled(
-                False, "调试模式下已禁用：justfloat 数据只通过录制 CSV 查看，不直接注入 DSH 上下文")
+        mode = cfg.get("mode", "serial")
+        self._w.set_mode(mode)
+        if mode in ("serial_vofa", "rtt_vofa"):
+            # 波形模式：串口 justfloat 数据不注入 DSH（AI 看数据走录制 CSV）；
+            # 录制剩余时间由轮询定时器刷新（两种 VoFA 模式都要跑，否则时长不显示）
+            if mode == "serial_vofa":
+                self._w.settings.set_ai_push_enabled(
+                    False, "串口+VoFA 模式下已禁用：串口 justfloat 数据只通过录制 CSV 查看，不直接注入 DSH 上下文")
             self._refresh_recorder_files()
             self._poll_recorder()
             self._recorder_timer.start()
@@ -146,16 +157,18 @@ class SerialController(QObject):
             return
         self._w.show_message(f"已保存配置 {path}")
 
-    def _on_debug_toggled(self, checked: bool):
-        """勾选调试模式 → 立即动态加载/卸载调试插件并刷新面板（无需重启）。"""
-        self._w.show_message("正在切换调试模式...")
+    def _on_mode_changed(self, mode: str):
+        """四态模式切换 → 立即动态加载/卸载插件并刷新面板（无需重启）。"""
+        cfg = self._svc("config")
+        if cfg is not None:
+            cfg.update({"mode": mode})
+        self._w.set_mode(mode)
+        self._w.show_message("正在切换运行模式...")
         cordis, loop = self._backend()
         if cordis is None or loop is None:
             self._w.show_error("后台循环未就绪，无法热切换（请重启程序）")
             return
-        asyncio.run_coroutine_threadsafe(
-            self._switch_debug(cordis, bool(checked)), loop
-        )
+        asyncio.run_coroutine_threadsafe(self._switch_mode(cordis, mode), loop)
 
     def _backend(self):
         """返回 (cordis 宿主, 后台事件循环)。"""
@@ -164,55 +177,65 @@ class SerialController(QObject):
             getattr(self._ctx, "backend_loop", None),
         )
 
-    async def _switch_debug(self, cordis, enabled: bool) -> None:
-        """后台执行：加载/卸载调试插件，重启 ai_server 刷新工具，广播事件。"""
+    async def _switch_mode(self, cordis, mode: str) -> None:
+        """后台执行：按四态模式加载/卸载插件，重启 ai_server 刷新工具，广播事件。"""
         from plugins.ai_server import Plugin as AiServerPlugin
         from plugins.float_recorder import Plugin as FloatRecorderPlugin
         from plugins.justfloat import Plugin as JustFloatPlugin
+        from plugins.rtt import Plugin as RttPlugin
         from plugins.tcp_forward import Plugin as TcpForwardPlugin
 
-        if enabled:
+        want_wave = mode in ("serial_vofa", "rtt_vofa")
+        want_rtt = mode in ("rtt_shell", "rtt_vofa")
+
+        # 卸载不需要的插件
+        for name in ("float_recorder", "justfloat", "tcp_forward"):
+            if not want_wave and cordis.ctx.get(name, strict=False) is not None:
+                await cordis.unload_plugin_async(name)
+        if not want_rtt and cordis.ctx.get("rtt", strict=False) is not None:
+            await cordis.unload_plugin_async("rtt")
+
+        # 加载需要的插件
+        if want_rtt and cordis.ctx.get("rtt", strict=False) is None:
+            await cordis.load_plugin_async(RttPlugin())
+        if want_wave:
             if cordis.ctx.get("tcp_forward", strict=False) is None:
                 await cordis.load_plugin_async(TcpForwardPlugin())
             if cordis.ctx.get("justfloat", strict=False) is None:
                 await cordis.load_plugin_async(JustFloatPlugin())
             if cordis.ctx.get("float_recorder", strict=False) is None:
                 await cordis.load_plugin_async(FloatRecorderPlugin())
-        else:
-            for name in ("float_recorder", "justfloat", "tcp_forward"):
-                if cordis.ctx.get(name, strict=False) is not None:
-                    await cordis.unload_plugin_async(name)
-        # 重启 AI 接口：重新注册/移除调试模式 MCP 工具（等旧端口释放）
+
+        # 重启 AI 接口：按新模式的可用服务重新注册 MCP 工具（等旧端口释放）
         if cordis.ctx.get("ai_server", strict=False) is not None:
             await cordis.unload_plugin_async("ai_server")
             await asyncio.sleep(0.5)
         await cordis.load_plugin_async(AiServerPlugin())
-        await self._ctx.emit("debug_mode_changed", {"debug_mode": bool(enabled)})
+        await self._ctx.emit("mode_changed", {"mode": mode})
 
-    def _on_debug_changed(self, data):
+    def _on_mode_changed_event(self, data):
         """后台切换完成 → 主线程刷新面板显隐与参数。"""
         data = data or {}
-        enabled = bool(data.get("debug_mode"))
-        self._w.set_debug_visible(enabled)
+        mode = data.get("mode", "serial")
+        self._w.set_mode(mode)
         cfg = self._svc("config")
         if cfg is not None:
             self._w.settings.set_config_path(cfg.path)
             self._w.tcp.apply_config(cfg.as_dict())
             self._w.justfloat.apply_config(cfg.as_dict())
             self._w.recorder.apply_config(cfg.as_dict())
-            if enabled:
-                self._w.settings.set_ai_push_enabled(
-                    False, "调试模式下已禁用：justfloat 数据只通过录制 CSV 查看，不直接注入 DSH 上下文")
+            self._w.rtt.apply_config(cfg.as_dict())
+            if mode in ("serial_vofa", "rtt_vofa"):
+                if mode == "serial_vofa":
+                    self._w.settings.set_ai_push_enabled(
+                        False, "串口+VoFA 模式下已禁用：串口 justfloat 数据只通过录制 CSV 查看，不直接注入 DSH 上下文")
                 self._refresh_recorder_files()
                 self._poll_recorder()
                 self._recorder_timer.start()
             else:
                 self._w.settings.set_ai_push_enabled(True)
                 self._recorder_timer.stop()
-        self._w.show_message(
-            "调试模式已开启（TCP 转发 / JustFloat 解析 / 浮点录制）" if enabled
-            else "调试模式已关闭"
-        )
+        self._w.show_message(f"运行模式已切换：{mode}")
 
     def _refresh_ports(self):
         serial = self._svc("serial")
@@ -280,6 +303,30 @@ class SerialController(QObject):
         if not status.get("running") and status.get("error"):
             self._w.show_error(f"TCP 转发启动失败：{status['error']}")
 
+    # ---------------- RTT 连接与 Shell ----------------
+    def _on_rtt_connect(self):
+        rtt = self._svc("rtt")
+        if rtt is None:
+            self._w.show_error("RTT 服务未就绪（当前模式未加载 RTT 插件）")
+            return
+        if rtt.is_connected:
+            rtt.disconnect()
+            return
+        ok, err = rtt.connect()
+        if not ok:
+            self._w.show_error(f"连接 J-Link 失败：{err}")
+        else:
+            self._w.show_message("已连接 J-Link RTT")
+
+    def _on_rtt_send(self, cmd: str):
+        rtt = self._svc("rtt")
+        if rtt is None:
+            self._w.show_error("RTT 服务未就绪")
+            return
+        ok, err = rtt.send_shell(cmd)
+        if not ok:
+            self._w.show_error(err or "shell 发送失败")
+
     # ---------------- justfloat 协议解析 ----------------
     def _on_justfloat_toggled(self, checked: bool):
         jf = self._svc("justfloat")
@@ -340,6 +387,8 @@ class SerialController(QObject):
             self._w.show_message(
                 f"录制达到时长自动结束：{Path(status.get('path', '')).name}"
             )
+            # 到点自动结束也要刷新已录文件列表，否则新文件不出现
+            self._refresh_recorder_files()
         self._w.recorder.set_status(status)
 
     def _poll_recorder(self):
@@ -532,6 +581,7 @@ class SerialController(QObject):
         data.update(self._w.send.settings_dict())
         data.update(self._w.tcp.settings_dict())
         data.update(self._w.recorder.settings_dict())
+        data.update(self._w.rtt.settings_dict())
         cfg.update(data)
         serial = self._svc("serial")
         if serial is not None and serial.is_open and self._w.settings.reconnect_enabled():

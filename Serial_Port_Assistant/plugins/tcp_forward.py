@@ -103,6 +103,17 @@ class TcpForwardService:
             self._log("TCP 转发已停止")
         self._emit_status()
 
+    def _route_to_target(self, data: bytes) -> None:
+        """客户端数据路由：RTT 已连接 → shell；否则 → 串口。"""
+        rtt = self._ctx.get("rtt", strict=False)
+        if rtt is not None and rtt.is_connected:
+            text = data.decode("utf-8", "ignore").strip()
+            if text:
+                rtt.send_shell(text, source="tcp")
+        elif self._serial.is_open:
+            self._serial.write(data, source="tcp")
+        # 两者都未连接时静默丢弃（避免 serial_error 弹窗刷屏）
+
     async def _handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
@@ -114,9 +125,7 @@ class TcpForwardService:
                 data = await reader.read(4096)
                 if not data:
                     break
-                if self._serial.is_open:
-                    self._serial.write(data, source="tcp")
-                # 串口未打开时静默丢弃（避免 serial_error 弹窗刷屏）
+                self._route_to_target(bytes(data))
         except asyncio.CancelledError:
             pass
         except (ConnectionError, OSError):
@@ -182,5 +191,17 @@ class Plugin:
             await svc.broadcast(bytes(data))
 
         ctx.on("serial_data_received", on_serial_rx)
+
+        # RTT 波形（ch1）→ 同样广播给 VoFA 客户端（模式4）
+        async def on_rtt_wave(data):
+            await svc.broadcast(bytes(data))
+
+        ctx.on("rtt_wave", on_rtt_wave)
+
+        # RTT shell 输出（ch0）→ 广播给客户端（远程 shell 终端）
+        async def on_rtt_shell_rx(data):
+            await svc.broadcast(bytes(data))
+
+        ctx.on("rtt_shell_rx", on_rtt_shell_rx)
         ctx.effect(lambda: None, svc.stop)
         log("TCP 转发服务已就绪（未启动）")

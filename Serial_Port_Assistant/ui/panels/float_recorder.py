@@ -119,17 +119,25 @@ class FloatRecorderPanel(QWidget):
         self.stop_btn.setEnabled(state in ("recording", "paused"))
         if path:
             from pathlib import Path
-            self.file_label.setText(Path(path).name)
+            self.file_label.setText(str(Path(path)))
+            self.file_label.setToolTip(str(Path(path)))
         else:
             self.file_label.setText("")
+            self.file_label.setToolTip("")
 
     def set_files(self, files: list) -> None:
+        from PyQt6.QtCore import Qt
         self.file_combo.blockSignals(True)
         self.file_combo.clear()
         for f in (files or []):
+            name = f.get("name", "")
+            path = f.get("path", "")
             self.file_combo.addItem(
-                f"{f.get('name', '')}  ({f.get('size', 0)} B)", f.get("name")
+                f"{name}  ({f.get('size', 0)} B)", name
             )
+            idx = self.file_combo.count() - 1
+            tip = path or name
+            self.file_combo.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
         self.file_combo.blockSignals(False)
 
     def apply_config(self, cfg: dict) -> None:

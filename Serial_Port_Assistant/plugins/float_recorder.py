@@ -326,6 +326,7 @@ class FloatRecorder:
             for p in sorted(self._dir.glob("*.csv")):
                 files.append({
                     "name": p.name,
+                    "path": str(p),
                     "size": p.stat().st_size,
                     "modified": datetime.fromtimestamp(p.stat().st_mtime).strftime(
                         "%Y-%m-%d %H:%M:%S"

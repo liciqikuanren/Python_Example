@@ -46,11 +46,30 @@ DEFAULTS = {
     "ai_push_enabled": False,
     "ai_push_mode": "chat",
     "ai_push_url": "http://127.0.0.1:3080/plugins/serial-bridge/incoming",
+    # AI 回复回写（DSH 桥 → 串口）：默认关闭（RTT 时代改用 shell_exec 工具下发命令）
+    "ai_reply_enabled": False,
+    "ai_reply_host": "127.0.0.1",
+    "ai_reply_port": 8766,
     # TCP 转发（服务端：串口 ↔ TCP 客户端）
     "tcp_host": "127.0.0.1",
     "tcp_port": 9000,
-    # 调试模式：False=正常模式（仅 AI 功能）；True=调试模式（+TCP 转发/justfloat/录制）
+    # 调试模式（已由 mode 四态取代，保留兼容旧配置）
     "debug_mode": False,
+    # 运行模式（四态）：serial=串口交互 / serial_vofa=串口+TCP VoFA 转发 / rtt_shell=RTT Shell / rtt_vofa=RTT Shell+波形+TCP VoFA
+    "mode": "serial",
+    # RTT（J-Link）配置
+    "rtt_chip": "STM32H743XI",
+    "rtt_serial_no": "",
+    "rtt_interface": "SWD",
+    "rtt_speed": 4000,
+    "rtt_control_block_addr": "",
+    "rtt_shell_channel": 0,
+    "rtt_wave_channel": 1,
+    "rtt_log_channel": 2,
+    "rtt_wave_channels": 8,
+    "rtt_shell_prompt": "HC_dqj@root:",
+    # JLinkARM.dll 显式路径（留空 = 自动搜索 EIDE 自带 / SEGGER 标准安装）
+    "rtt_jlink_dll": "",
     # justfloat 协议解析（调试模式）
     "justfloat_enabled": True,
     "justfloat_channel_names": {},  # 通道重命名：{"0": "PumpRPM", "1": "Flow_L_min", ...}
@@ -90,6 +109,9 @@ class ConfigStore:
             raw = self._read_file(self._legacy_json_path())
         if isinstance(raw, dict):
             self._data.update({k: v for k, v in raw.items() if k in DEFAULTS})
+            # 旧配置迁移：debug_mode=True 且未显式设置 mode → serial_vofa
+            if "mode" not in raw and raw.get("debug_mode"):
+                self._data["mode"] = "serial_vofa"
         return dict(self._data)
 
     def load_from(self, path: Path | str) -> dict:

@@ -10,6 +10,13 @@ from ui.constants import (
     BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, PARITY_BY_VALUE, STOP_BITS,
 )
 
+MODES = [
+    ("串口交互", "serial"),
+    ("串口 + TCP VoFA 转发", "serial_vofa"),
+    ("RTT Shell 交互", "rtt_shell"),
+    ("RTT Shell + 波形 + TCP VoFA", "rtt_vofa"),
+]
+
 
 class SettingsPanel(QWidget):
     open_clicked = pyqtSignal()
@@ -18,7 +25,7 @@ class SettingsPanel(QWidget):
     params_changed = pyqtSignal()
     load_config_clicked = pyqtSignal()
     save_config_clicked = pyqtSignal()
-    debug_mode_toggled = pyqtSignal(bool)
+    mode_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -106,19 +113,21 @@ class SettingsPanel(QWidget):
         ai_row.addWidget(QLabel("模式"))
         ai_row.addWidget(self.ai_push_mode_combo)
         # ---- MCP 服务状态标识 ----
-        self.ai_status_label = QLabel("AI 接口：启动中...")
+        self.ai_status_label = QLabel("AI嵌入式工具：启动中...")
         self.ai_status_label.setStyleSheet("color: #888;")
         ai_row.addSpacing(16)
         ai_row.addWidget(self.ai_status_label)
         ai_row.addStretch(1)
         grid.addLayout(ai_row, 2, 0, 1, 6)
 
-        # ---- 运行模式：正常（仅 AI）/ 调试（+TCP 转发/justfloat/录制）----
+        # ---- 运行模式（四态）----
         mode_row = QHBoxLayout()
-        self.debug_mode_check = QCheckBox("调试模式（TCP 转发 / JustFloat 解析 / 浮点录制）")
-        self.debug_mode_check.setToolTip("勾选后立即生效（动态加载/卸载调试插件）；正常模式下仅提供 AI 功能")
+        self.mode_combo = QComboBox()
+        for label, value in MODES:
+            self.mode_combo.addItem(label, value)
+        self.mode_combo.setToolTip("切换后立即生效（动态加载/卸载 RTT 与调试插件）")
         mode_row.addWidget(QLabel("运行模式"))
-        mode_row.addWidget(self.debug_mode_check)
+        mode_row.addWidget(self.mode_combo)
         mode_row.addStretch(1)
         grid.addLayout(mode_row, 3, 0, 1, 6)
 
@@ -136,6 +145,39 @@ class SettingsPanel(QWidget):
         cfg_row.addWidget(self.save_config_btn)
         grid.addLayout(cfg_row, 4, 0, 1, 6)
 
+        # ---- RTT / J-Link 设置（折叠）----
+        self.rtt_btn = QPushButton("RTT / J-Link 设置 ▾")
+        self.rtt_btn.setCheckable(True)
+        self.rtt_btn.toggled.connect(self._on_rtt_toggled)
+        grid.addWidget(self.rtt_btn, 5, 0, 1, 6)
+
+        self.rtt_chip_edit = QLineEdit("STM32H743XI")
+        self.rtt_chip_edit.setPlaceholderText("芯片型号，如 STM32H743XI")
+        self.rtt_iface_combo = QComboBox()
+        self.rtt_iface_combo.addItems(["SWD", "JTAG"])
+        self.rtt_speed_edit = QLineEdit("4000")
+        self.rtt_speed_edit.setPlaceholderText("接口速度 kHz")
+        self.rtt_serial_edit = QLineEdit("")
+        self.rtt_serial_edit.setPlaceholderText("序列号（留空=自动）")
+
+        self.rtt_widget = QWidget()
+        rtt_grid = QGridLayout(self.rtt_widget)
+        rtt_grid.setContentsMargins(0, 0, 0, 0)
+        rtt_grid.setHorizontalSpacing(6)
+        rtt_grid.setVerticalSpacing(6)
+        rtt_grid.addWidget(QLabel("芯片"), 0, 0)
+        rtt_grid.addWidget(self.rtt_chip_edit, 0, 1)
+        rtt_grid.addWidget(QLabel("接口"), 0, 2)
+        rtt_grid.addWidget(self.rtt_iface_combo, 0, 3)
+        rtt_grid.addWidget(QLabel("速度(kHz)"), 1, 0)
+        rtt_grid.addWidget(self.rtt_speed_edit, 1, 1)
+        rtt_grid.addWidget(QLabel("序列号"), 1, 2)
+        rtt_grid.addWidget(self.rtt_serial_edit, 1, 3)
+        rtt_grid.setColumnStretch(1, 1)
+        rtt_grid.setColumnStretch(3, 1)
+        self.rtt_widget.setVisible(False)
+        grid.addWidget(self.rtt_widget, 6, 0, 1, 6)
+
         # ---- 信号接线 ----
         self.reconnect_check.toggled.connect(self._on_reconnect_toggled)
         for combo in (self.baud_combo, self.data_combo, self.stop_combo,
@@ -144,7 +186,11 @@ class SettingsPanel(QWidget):
         self.port_combo.currentTextChanged.connect(self._on_param_changed)
         self.ai_push_check.toggled.connect(self._on_ai_push_changed)
         self.ai_push_mode_combo.currentTextChanged.connect(self._on_ai_push_changed)
-        self.debug_mode_check.toggled.connect(self._on_debug_toggled)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.rtt_chip_edit.textChanged.connect(self._on_param_changed)
+        self.rtt_iface_combo.currentTextChanged.connect(self._on_param_changed)
+        self.rtt_speed_edit.textChanged.connect(self._on_param_changed)
+        self.rtt_serial_edit.textChanged.connect(self._on_param_changed)
         self.load_config_btn.clicked.connect(self.load_config_clicked.emit)
         self.save_config_btn.clicked.connect(self.save_config_clicked.emit)
 
@@ -155,6 +201,10 @@ class SettingsPanel(QWidget):
     def _on_advanced_toggled(self, checked: bool):
         self.advanced_widget.setVisible(checked)
         self.advanced_btn.setText("高级设置 ▴" if checked else "高级设置 ▾")
+
+    def _on_rtt_toggled(self, checked: bool):
+        self.rtt_widget.setVisible(checked)
+        self.rtt_btn.setText("RTT / J-Link 设置 ▴" if checked else "RTT / J-Link 设置 ▾")
 
     def _on_reconnect_toggled(self, checked: bool):
         if not self._applying:
@@ -169,10 +219,10 @@ class SettingsPanel(QWidget):
         if not self._applying:
             self.params_changed.emit()
 
-    def _on_debug_toggled(self, checked: bool):
+    def _on_mode_changed(self, index: int):
         if not self._applying:
             self.params_changed.emit()
-            self.debug_mode_toggled.emit(checked)
+            self.mode_changed.emit(self.mode_combo.currentData() or "serial")
 
     # ---------------- 对外接口 ----------------
     def serial_params(self) -> dict:
@@ -263,7 +313,17 @@ class SettingsPanel(QWidget):
             idx = self.ai_push_mode_combo.findData(mode)
             if idx >= 0:
                 self.ai_push_mode_combo.setCurrentIndex(idx)
-            self.debug_mode_check.setChecked(bool(cfg.get("debug_mode", False)))
+            mode = cfg.get("mode", "serial")
+            idx = self.mode_combo.findData(mode)
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
+            self.rtt_chip_edit.setText(str(cfg.get("rtt_chip", "STM32H743XI")))
+            iface = str(cfg.get("rtt_interface", "SWD"))
+            idx = self.rtt_iface_combo.findText(iface)
+            if idx >= 0:
+                self.rtt_iface_combo.setCurrentIndex(idx)
+            self.rtt_speed_edit.setText(str(cfg.get("rtt_speed", 4000)))
+            self.rtt_serial_edit.setText(str(cfg.get("rtt_serial_no", "")))
         finally:
             self._applying = False
 
@@ -272,14 +332,14 @@ class SettingsPanel(QWidget):
             self.config_path_edit.setText(path)
 
     def set_ai_status(self, ready: bool, host: str = "", port: int = 0) -> None:
-        """显示内置 MCP（AI 接口）服务状态。"""
+        """显示内置 MCP（AI嵌入式工具）服务状态。"""
         if ready:
             self.ai_status_label.setText(
-                f"AI 接口：运行中 http://{host}:{port}/mcp"
+                f"AI嵌入式工具：运行中 http://{host}:{port}/mcp"
             )
             self.ai_status_label.setStyleSheet("color: #4caf50;")
         else:
-            self.ai_status_label.setText("AI 接口：已停止")
+            self.ai_status_label.setText("AI嵌入式工具：已停止")
             self.ai_status_label.setStyleSheet("color: #888;")
 
     def set_ai_push_enabled(self, enabled: bool, reason: str = "") -> None:
@@ -301,8 +361,15 @@ class SettingsPanel(QWidget):
             "auto_reconnect": self.reconnect_enabled(),
             "ai_push_enabled": self.ai_push_check.isChecked(),
             "ai_push_mode": self.ai_push_mode_combo.currentData() or "chat",
-            "debug_mode": self.debug_mode_check.isChecked(),
+            "mode": self.mode_combo.currentData() or "serial",
+            "rtt_chip": self.rtt_chip_edit.text().strip() or "STM32H743XI",
+            "rtt_interface": self.rtt_iface_combo.currentText(),
+            "rtt_speed": self.rtt_speed_edit.text().strip() or "4000",
+            "rtt_serial_no": self.rtt_serial_edit.text().strip(),
         }
+
+    def current_mode(self) -> str:
+        return self.mode_combo.currentData() or "serial"
 
     @staticmethod
     def _set_combo_text(combo: QComboBox, text: str) -> None:

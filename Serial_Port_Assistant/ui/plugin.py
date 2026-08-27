@@ -55,6 +55,24 @@ class Plugin:
         async def on_debug_changed(data):
             bridge.debug_mode_changed.emit(data)
 
+        async def on_mode_changed(data):
+            bridge.mode_changed.emit(data)
+
+        async def on_rtt_shell_rx(data):
+            bridge.rtt_shell_rx.emit(data)
+
+        async def on_rtt_log(data):
+            bridge.rtt_log.emit(data)
+
+        async def on_rtt_status(data):
+            bridge.rtt_status.emit(data)
+
+        async def on_rtt_shell_tx(data):
+            data = data or {}
+            bridge.rtt_shell_tx.emit(
+                data.get("command", ""), data.get("source", "human")
+            )
+
         ctx.on("serial_data_received", on_rx)
         ctx.on("serial_data_sent", on_tx)
         ctx.on("services_ready", on_ready)
@@ -64,6 +82,11 @@ class Plugin:
         ctx.on("justfloat_status", on_justfloat_status)
         ctx.on("float_recorder_status", on_recorder_status)
         ctx.on("debug_mode_changed", on_debug_changed)
+        ctx.on("mode_changed", on_mode_changed)
+        ctx.on("rtt_shell_rx", on_rtt_shell_rx)
+        ctx.on("rtt_log", on_rtt_log)
+        ctx.on("rtt_status", on_rtt_status)
+        ctx.on("rtt_shell_tx", on_rtt_shell_tx)
 
         for event, short_name in STATE_EVENTS.items():
 

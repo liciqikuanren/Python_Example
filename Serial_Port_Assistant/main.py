@@ -30,31 +30,36 @@ PLUGINS_DIR = HERE / "plugins"
 def run_backend(cordis: Cordis, stop: threading.Event) -> None:
     """后台线程：在 asyncio 循环里加载业务插件并维持运行。
 
-    加载策略：先加载 config（读取运行模式），再按 debug_mode 决定是否加载
-    调试插件（tcp_forward / justfloat / float_recorder）：
-      - 正常模式（debug_mode=False）：仅 AI 功能（ai_server 等）；
-      - 调试模式（debug_mode=True）：额外启用 TCP 转发、justfloat 解析、浮点录制。
+    加载策略：先加载 config（读取四态运行模式 mode），再按模式决定加载哪些插件：
+      - serial / rtt_shell：不加载波形/录制插件（tcp_forward/justfloat/float_recorder）；
+      - serial / serial_vofa：不加载 RTT；
+      - serial_vofa / rtt_vofa：额外加载 TCP 转发、justfloat 解析、浮点录制。
     """
 
     async def main_async():
-        # 1. 配置插件先行（读取 debug_mode）
+        # 1. 配置插件先行（读取四态模式 mode）
         from plugins.config import Plugin as ConfigPlugin
 
         cordis.load_plugin(ConfigPlugin())
         loaded = ["config"]
-        debug_mode = bool(cordis.ctx.get("config").get("debug_mode", False))
+        config = cordis.ctx.get("config")
+        mode = config.get("mode", "serial")
 
         # 暴露 Host 与后台循环（UI 控制器据此动态加载/卸载调试插件）
         cordis.ctx.host = cordis
         cordis.ctx.backend_loop = asyncio.get_running_loop()
 
-        # 2. 按模式加载其余业务插件
+        # 2. 按四态模式加载其余业务插件
         exclude = {"config"}
-        if not debug_mode:
+        if mode in ("serial", "rtt_shell"):
+            # 模式1（串口交互）/ 模式3（RTT Shell）：不加载波形/录制插件
             exclude |= {"tcp_forward", "justfloat", "float_recorder"}
+        if mode in ("serial", "serial_vofa"):
+            # 串口模式：不加载 RTT
+            exclude |= {"rtt"}
         loaded += cordis.load_dir(PLUGINS_DIR, exclude=exclude)
 
-        await cordis.ctx.emit("services_ready", {"debug_mode": debug_mode})
+        await cordis.ctx.emit("services_ready", {"mode": mode})
         try:
             while not stop.is_set():
                 await asyncio.sleep(0.1)

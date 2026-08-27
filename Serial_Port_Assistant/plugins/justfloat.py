@@ -275,7 +275,7 @@ class Plugin:
 
         last_status_ts = [0.0]
 
-        async def on_serial_rx(data):
+        async def on_wave(data):
             frames = svc.feed(bytes(data))
             for f in frames:
                 if f["kind"] == "image":
@@ -288,7 +288,9 @@ class Plugin:
                 last_status_ts[0] = now
                 await ctx.emit("justfloat_status", svc.stats())
 
-        ctx.on("serial_data_received", on_serial_rx)
+        # 串口 justfloat（模式2）与 RTT 波形（模式4）共用同一解析入口
+        ctx.on("serial_data_received", on_wave)
+        ctx.on("rtt_wave", on_wave)
 
         def teardown():
             svc.stop()

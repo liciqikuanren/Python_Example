@@ -8,12 +8,14 @@
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QLabel, QMainWindow, QMessageBox, QSplitter, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from ui.panels.float_recorder import FloatRecorderPanel
 from ui.panels.justfloat import JustFloatPanel
 from ui.panels.receive import ReceivePanel
+from ui.panels.rtt import RttPanel
 from ui.panels.send import SendPanel
 from ui.panels.settings import SettingsPanel
 from ui.panels.tcp_forward import TcpForwardPanel
@@ -30,9 +32,11 @@ class MainWindow(QMainWindow):
         self.recorder = FloatRecorderPanel()
         self.receive = ReceivePanel()
         self.send = SendPanel()
+        self.rtt = RttPanel()
 
-        # ---- 左列：参数设置 ----
+        # ---- 左列：参数设置（可折叠） ----
         left = QWidget()
+        self.config_panel = left
         left_box = QVBoxLayout(left)
         left_box.setContentsMargins(0, 0, 0, 0)
         left_box.setSpacing(8)
@@ -49,6 +53,7 @@ class MainWindow(QMainWindow):
         right_box.setSpacing(8)
         right_box.addWidget(self.receive, stretch=1)
         right_box.addWidget(self.send)
+        right_box.addWidget(self.rtt, stretch=1)
 
         # ---- 左右分栏 ----
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -63,20 +68,50 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # 顶部工具条：配置栏折叠开关
+        top_bar = QHBoxLayout()
+        self.config_toggle = QPushButton("☰ 配置")
+        self.config_toggle.setCheckable(True)
+        self.config_toggle.setChecked(False)
+        self.config_toggle.setToolTip("点击展开/收起左侧配置栏")
+        self.config_toggle.toggled.connect(self._toggle_config)
+        top_bar.addWidget(self.config_toggle)
+        top_bar.addStretch(1)
+        layout.addLayout(top_bar)
+
         layout.addWidget(self.splitter)
         self.setCentralWidget(central)
+
+        # 默认收起配置栏（右列占满）
+        self.config_panel.setVisible(False)
 
         self.state_label = QLabel("未连接")
         self.statusBar().addWidget(self.state_label, 1)
 
+        self.set_mode("serial")
         self.resize(1180, 820)
         self.setMinimumSize(980, 640)
 
-    def set_debug_visible(self, visible: bool) -> None:
-        """调试模式显隐 TCP 转发 / justfloat / 录制面板（正常模式仅 AI 功能）。"""
-        self.tcp.setVisible(visible)
-        self.justfloat.setVisible(visible)
-        self.recorder.setVisible(visible)
+    def _toggle_config(self, checked: bool) -> None:
+        self.config_panel.setVisible(checked)
+
+    def set_mode(self, mode: str) -> None:
+        """按四态模式显隐面板。
+
+        serial/serial_vofa → 串口控制台（接收+发送）；
+        rtt_shell/rtt_vofa  → RTT 控制台；
+        serial_vofa/rtt_vofa → 波形调试面板（TCP 转发 / justfloat / 录制）。
+        """
+        is_rtt = mode in ("rtt_shell", "rtt_vofa")
+        is_wave = mode in ("serial_vofa", "rtt_vofa")
+        self.receive.setVisible(not is_rtt)
+        self.send.setVisible(not is_rtt)
+        self.rtt.setVisible(is_rtt)
+        self.tcp.setVisible(is_wave)
+        self.justfloat.setVisible(is_wave)
+        self.recorder.setVisible(is_wave)
 
     def set_state(self, text: str) -> None:
         self.state_label.setText(text)

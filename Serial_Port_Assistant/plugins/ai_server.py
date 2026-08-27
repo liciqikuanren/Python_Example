@@ -4,10 +4,14 @@
 - AI 的发送经 transmitter（source="ai"），会在接收区打 [AI] 标签；
 - AI 读取接收数据走独立缓冲区，不影响人类接收显示。
 - 传输用 streamable-http（兼容 @deepseek-ai/dsh-mcp-client 等客户端）。
+- 另起轻量 HTTP 服务（ai_reply_host:ai_reply_port，默认 127.0.0.1:8766）：
+  接收 DSH serial-bridge 回写的 AI 回复（POST / {text}），从串口发出，实现双向联动。
 """
 
 import asyncio
+import http.server
 import json
+import re
 import threading
 import urllib.request
 from collections import deque
@@ -61,7 +65,7 @@ def build_server(serial, transmitter, config, log, rxbuf: RxBuffer,
     extra = extra or {}
     host = config.get("ai_server_host", "127.0.0.1")
     port = int(config.get("ai_server_port", 8765))
-    mcp = FastMCP("serial-assistant", host=host, port=port,
+    mcp = FastMCP("AI嵌入式工具", host=host, port=port,
                   streamable_http_path="/mcp", log_level="WARNING",
                   stateless_http=True)
 
@@ -108,7 +112,7 @@ def build_server(serial, transmitter, config, log, rxbuf: RxBuffer,
             "baudrate": p.get("baudrate", 0),
             "pending_rx_bytes": rxbuf.pending,
             "ai_rx_total_bytes": rxbuf.total,
-            "debug_mode": bool(config.get("debug_mode", False)),
+            "mode": config.get("mode", "serial"),
         }
 
     debug_mode = bool(extra.get("justfloat"))
@@ -193,7 +197,7 @@ def build_server(serial, transmitter, config, log, rxbuf: RxBuffer,
     def config_status() -> dict:
         """查询当前配置文件路径与配置项数量。"""
         return {"path": config.path, "keys": len(_CONFIG_KEYS),
-                "debug_mode": bool(config.get("debug_mode", False))}
+                "mode": config.get("mode", "serial")}
 
     @mcp.tool()
     def config_save(path: str = "") -> dict:
@@ -210,7 +214,7 @@ def build_server(serial, transmitter, config, log, rxbuf: RxBuffer,
         else:
             config.load()
         return {"ok": True, "path": config.path,
-                "debug_mode": bool(config.get("debug_mode", False))}
+                "mode": config.get("mode", "serial")}
 
     @mcp.tool()
     def config_set(key: str, value) -> dict:
@@ -342,21 +346,50 @@ def build_server(serial, transmitter, config, log, rxbuf: RxBuffer,
             fr.set_sample_hz(hz)
             return {"ok": True, "sample_hz": fr.status()["sample_hz"]}
 
+    # ---------------- RTT 工具（shell 响应式 + log 拉取式） ----------------
+    rtt = extra.get("rtt")
+    if rtt is not None:
+
+        @mcp.tool()
+        def rtt_connect() -> dict:
+            """连接 J-Link 并启动 RTT（shell ch0 / 波形 ch1 / 日志 ch2）。"""
+            ok, err = rtt.connect()
+            return {"ok": ok, "message": err or "已连接"}
+
+        @mcp.tool()
+        def rtt_disconnect() -> dict:
+            """断开 J-Link RTT 连接。"""
+            rtt.disconnect()
+            return {"ok": True, "message": "已断开"}
+
+        @mcp.tool()
+        def rtt_status() -> dict:
+            """查询 RTT 连接状态。"""
+            return rtt.status()
+
+        @mcp.tool()
+        def shell_exec(command: str, timeout: float = 3.0) -> dict:
+            """响应式执行 RTT shell 命令（发送后等待提示符返回，返回去 ANSI 输出）。"""
+            return rtt.exec_shell(command, timeout)
+
+        @mcp.tool()
+        def read_log(count: int = 500, grep: str = "", level: str = "") -> dict:
+            """按需拉取 RTT 设备日志（ch2）。level 可选 DEBUG/INFO/WARN/ERROR；grep 为子串过滤。"""
+            return rtt.read_log(count, grep, level)
+
     return mcp
 
 
-def _push_received(data: bytes, config) -> None:
-    """把接收到的数据推送到 DSH 串口桥（fire-and-forget，失败静默）。"""
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _push_payload(payload: dict, config) -> None:
+    """把 payload 推送到 DSH 桥（fire-and-forget，失败静默）。"""
     if not config.get("ai_push_enabled", False):
         return
     url = config.get("ai_push_url", "")
     if not url:
         return
-    payload = {
-        "text": bytes_to_text(data, config.get("rx_encoding", "UTF-8")),
-        "hex": bytes_to_hex(data),
-        "mode": config.get("ai_push_mode", "chat"),
-    }
 
     def _post():
         try:
@@ -368,9 +401,105 @@ def _push_received(data: bytes, config) -> None:
             )
             urllib.request.urlopen(req, timeout=2)
         except Exception:
-            pass  # 推送失败不影响串口主流程
+            pass  # 推送失败不影响主流程
 
     threading.Thread(target=_post, daemon=True).start()
+
+
+def _push_received(data: bytes, config) -> None:
+    """把接收到的串口数据推送到 DSH 桥。"""
+    _push_payload({
+        "text": bytes_to_text(data, config.get("rx_encoding", "UTF-8")),
+        "hex": bytes_to_hex(data),
+        "mode": config.get("ai_push_mode", "chat"),
+    }, config)
+
+
+def _push_text(text: str, config) -> None:
+    """把纯文本（shell 输出等）推送到 DSH 桥。"""
+    _push_payload({
+        "text": text,
+        "hex": "",
+        "mode": config.get("ai_push_mode", "chat"),
+    }, config)
+
+
+class ReplyHttpServer:
+    """轻量 HTTP 服务：接收 DSH serial-bridge 回写的 AI 回复，从串口发出。
+
+    端点：POST /  {text}  →  transmitter.send(text, source="ai")
+    双向联动闭环：串口收到数据 → 桥注入 Agent → AI 回复 → 桥 POST 到这里 → 串口发出。
+    """
+
+    def __init__(self, transmitter, log):
+        self._transmitter = transmitter
+        self._log = log
+        self._server = None
+        self._thread = None
+
+    def start(self, host: str, port: int) -> bool:
+        try:
+            server = http.server.ThreadingHTTPServer(
+                (host, port), self._make_handler()
+            )
+        except Exception as e:
+            self._log(f"AI 回复服务启动失败：{e}")
+            return False
+        self._server = server
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+            self._server = None
+
+    def _make_handler(self):
+        transmitter = self._transmitter
+        log = self._log
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = self.rfile.read(length) if length > 0 else b""
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._reply(400, {"ok": False, "error": "bad json"})
+                text = body.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    return self._reply(400, {"ok": False, "error": "empty text"})
+                ok, err = transmitter.send(
+                    text, False, "UTF-8", True, "CRLF", source="ai"
+                )
+                return self._reply(200, {"ok": ok, "message": err or "已发送"})
+
+            def do_GET(self):  # noqa: N802
+                return self._reply(200, {"ok": True, "service": "serial-bridge-reply"})
+
+            def _reply(self, code: int, payload: dict):
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except Exception:
+                    pass
+
+            def log_message(self, fmt, *args):  # 静默访问日志
+                try:
+                    log(f"AI 回复服务：{fmt % args}")
+                except Exception:
+                    pass
+
+        return _Handler
 
 
 class Plugin:
@@ -391,19 +520,30 @@ class Plugin:
 
         # 懒获取调试模式服务（正常模式未加载 → None，不注册对应工具）
         extra = {}
-        for name in ("tcp_forward", "justfloat", "float_recorder"):
+        for name in ("tcp_forward", "justfloat", "float_recorder", "rtt"):
             svc = ctx.get(name, strict=False)
             if svc is not None:
                 extra[name] = svc
-        debug_mode = bool(extra)
+        mode = config.get("mode", "serial")
+        rtt_svc = extra.get("rtt")
 
         async def on_rx(data):
-            # 调试模式：justfloat 数据流不缓存、不注入 DSH 上下文（AI 查看数据走录制 CSV）
-            if not debug_mode:
+            # 仅串口交互模式注入串口数据到 DSH；波形模式不注入（走录制 CSV）
+            if mode == "serial":
                 rxbuf.push(data)
                 _push_received(data, config)
 
         ctx.on("serial_data_received", on_rx)
+
+        async def on_rtt_shell_rx(data):
+            # RTT 模式把 shell 输出（去 ANSI）注入 DSH；AI 自己命令的响应不注入
+            if mode in ("rtt_shell", "rtt_vofa"):
+                if rtt_svc is not None and rtt_svc.current_source() == "ai":
+                    return
+                text = _ANSI_RE.sub("", bytes(data).decode("utf-8", "ignore"))
+                _push_text(text, config)
+
+        ctx.on("rtt_shell_rx", on_rtt_shell_rx)
 
         server = build_server(serial, transmitter, config, log, rxbuf, extra)
         ctx.provide("ai_server", server)
@@ -423,6 +563,19 @@ class Plugin:
 
         task = loop.create_task(_run_server())
 
+        # AI 回复回写服务（DSH 桥 → 串口，仅串口模式；RTT 模式用 shell_exec 工具）
+        reply = ReplyHttpServer(transmitter, log)
+        reply_ok = False
+        if config.get("ai_reply_enabled", False) and mode in ("serial", "serial_vofa"):
+            reply_ok = reply.start(
+                config.get("ai_reply_host", "127.0.0.1"),
+                int(config.get("ai_reply_port", 8766)),
+            )
+            if reply_ok:
+                log(
+                    f"AI 回复回写服务已启动：http://{config.get('ai_reply_host', '127.0.0.1')}:{int(config.get('ai_reply_port', 8766))}/"
+                )
+
         def on_done(t):
             if t.cancelled():
                 return
@@ -440,6 +593,7 @@ class Plugin:
                 await task
             except (asyncio.CancelledError, SystemExit):
                 pass
+            reply.stop()
             log("AI 接口已停止")
 
         ctx.effect(lambda: None, teardown)

@@ -198,27 +198,56 @@ DSH 用 `@deepseek-ai/dsh-mcp-client` 配 `transport: streamable-http`）。
 
 ## AI 联动推送（串口数据直连 DSH Agent）
 
-串口助手可把**接收到的数据**推送到 DSH 的 `serial-bridge` 插件，注入当前 Agent 会话，
-让 AI 像聊天一样实时响应串口数据。两种模式（可随时切换）：
+串口助手可把**接收到的数据**推送到 DSH 的 `serial-bridge` 插件，注入选定的 Agent 会话，
+让 AI 像聊天一样实时响应串口数据。两种模式（可在 DSH 页面切换）：
 
 - **聊天**：每收到一条数据，AI 就回一条。
 - **监听**：数据先缓冲，按间隔合并成一条监控消息再交给 AI。
+
+> **总开关在 DSH 侧**：`serial-bridge` 默认 `mode=off`（不注入），并忽略
+> `incoming` 请求体里的 `mode` 字段——只有你在 DSH 页面上打开注入（聊天/监听）才会注入，
+> 串口助手无法绕过。串口助手侧的 `ai_push_mode` 仅作为参考值。
+
+**双向联动（默认开）**：注入串口数据后，DSH 桥等 AI 回复回合结束，把回复回写串口助手
+（`POST {text}` 到 `ai_reply_host:ai_reply_port`，默认 `http://127.0.0.1:8766/`），
+串口助手再通过 `transmitter`（source="ai"）把 AI 回答从串口发出。
+可在 DSH 悬浮面板里勾选/取消「AI 回复回写串口」，或 `POST /plugins/serial-bridge/echo {enabled}` 切换。
+
+**页面回复 ≠ 串口回复**：回写串口前默认做**简化**（`simplifyReply`，默认开）——
+去 Markdown 符号、压缩空行、截断（默认 600 字符），只发核心内容；页面上的完整回答不变。
+可在面板勾选/取消「串口回复简化」，或 `POST /plugins/serial-bridge/echo {enabled, simplify, maxChars}` 调整。
 
 配置（`~/.serial_assistant/config.json`）：
 
 | 键 | 说明 |
 |---|---|
-| `ai_push_enabled` | 是否开启推送 |
-| `ai_push_mode` | `chat` / `monitor` |
+| `ai_push_enabled` | 是否推送（串口助手侧开关；还需 DSH 侧总开关打开才真正注入） |
+| `ai_push_mode` | `chat` / `monitor`（仅参考，实际模式由 DSH 侧决定） |
 | `ai_push_url` | 桥地址，默认 `http://127.0.0.1:3080/plugins/serial-bridge/incoming` |
-
-GUI 的「串口设置 → AI 联动」可直接开关并切换模式。
+| `ai_reply_enabled` | 是否开启 AI 回复回写 HTTP 服务（默认开） |
+| `ai_reply_host` / `ai_reply_port` | 回复回写服务地址，默认 `127.0.0.1:8766` |
 
 DSH 侧的桥插件在 `dsh-serial-bridge/`（Node），装到 DSH web profile 的 `node_modules/serial-bridge`
 并注册进 `cordis.patch.yml` 后，**重启 DSH** 生效。桥端点：
 
-- `POST /plugins/serial-bridge/incoming` `{text, hex, mode}`
-- `POST /plugins/serial-bridge/mode` `{mode, monitorMs?}`
-- `POST /plugins/serial-bridge/status` `{}`
+- `POST /plugins/serial-bridge/incoming` `{text, hex}` — 推送数据（mode 忽略，由 DSH 侧开关决定）
+- `POST /plugins/serial-bridge/mode` `{mode, monitorMs?}` — 总开关/模式：`off` / `chat` / `monitor`
+- `POST /plugins/serial-bridge/echo` `{enabled?, simplify?, maxChars?}` — 回写开关 / 简化开关 / 截断长度
+- `POST /plugins/serial-bridge/target` `{agentId}` — 指定注入会话（`""` = 自动选最新会话）
+- `POST /plugins/serial-bridge/status` `{}` — 查询状态 + 在线会话列表（`agents`、`latestAgentId`）
+
+### DSH 页面悬浮面板
+
+插件通过 `webServer.tapIndex` 向 DSH 每个页面注入一个右下角悬浮「串口」按钮，点击弹出面板：
+
+- **总开关**：关闭 / 聊天 / 监听（默认关闭，不开启就不注入）
+- **注入会话**：下拉精确选择串口数据注入到哪个 Agent 会话（或「自动 = 最新会话」），
+  下拉显示会话标题/目录名，悬停可看完整 id 与创建时间
+- **AI 回复回写串口**：勾选后，AI 的回答自动从串口发出（双向联动）
+- **串口回复简化**：勾选后回写前自动去 Markdown/压行/截断，只发核心内容（页面回答不变）
+- **状态**：当前模式、目标会话、在线会话数、缓冲字符数、回写开关，每 3 秒自动刷新
+
+修改插件代码后需**重启 DSH**（`node_modules/serial-bridge` 是启动时加载的静态插件，
+无热重载）。
 
 
